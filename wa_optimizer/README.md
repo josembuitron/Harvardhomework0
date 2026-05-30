@@ -92,8 +92,11 @@ python optimize_wa.py --input data/stop_information.csv --outdir output
 python optimize_wa.py --input data/stop_information.csv --no-geocode
 ```
 
-En **Windows**: instala Python 3.11+, abre PowerShell en esta carpeta y corre los
-mismos comandos. Tu conexión local geocodifica sin problema → mapa preciso.
+En **Windows** (forma fácil): coloca `optimize_wa.py`, `run_windows.bat` y tu
+`stop_information.csv` en una carpeta y haz **doble clic en `run_windows.bat`**
+(o arrastra el CSV sobre el .bat). Instala dependencias y genera todo en `salida/`.
+Requiere Python 3.11+ ([descargar](https://www.python.org/downloads/), marca
+"Add Python to PATH"). Para Google: `set GOOGLE_MAPS_API_KEY=TU_KEY` antes de ejecutar.
 
 ---
 
