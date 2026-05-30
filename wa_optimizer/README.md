@@ -45,21 +45,33 @@ Excel con la propuesta y un mapa de agrupación por WA.
 El cálculo de densidad real y el mapa preciso necesitan coordenadas (lat/long).
 El script las obtiene así, en orden:
 
-1. **US Census Bureau batch geocoder** — gratis, sin API key, hasta 10.000
+1. **Google Maps Geocoding API** (recomendada / la más precisa) — requiere API key.
+   `maps.googleapis.com`. Devuelve `location_type` (ROOFTOP, RANGE_INTERPOLATED,
+   GEOMETRIC_CENTER, APPROXIMATE) y `partial_match`, que el script usa para
+   **marcar direcciones erradas o de baja precisión** y **detectar puntos fuera
+   del área de operación**. Volumen de 1.070 direcciones = dentro del **tier
+   gratuito de 10.000/mes** → costo $0. Se pasa con `--google-key` o la variable
+   de entorno `GOOGLE_MAPS_API_KEY`.
+2. **US Census Bureau batch geocoder** — gratis, sin API key, hasta 10.000
    direcciones por lote. (`geocoding.geo.census.gov`)
-2. **Nominatim / OpenStreetMap** — para las direcciones que el Census no resuelva.
-   (`nominatim.openstreetmap.org`, 1 req/seg)
-3. **Geografía relativa (proxy, offline)** — si la red bloquea los geocodificadores,
-   deriva una geografía aproximada de **Ruta + Secuencia + ETA + nombre de calle**
-   (la geografía que RouteSmart ya calculó). El **balanceo sigue siendo válido**;
-   solo el mapa pierde precisión de mapa base (se marca con un aviso).
+3. **Nominatim / OpenStreetMap** — fallback. (`nominatim.openstreetmap.org`)
+4. **Geografía relativa (proxy, offline)** — si no hay red ni key, deriva una
+   geografía aproximada de **Ruta + Secuencia + ETA + nombre de calle**. El
+   **balanceo sigue siendo válido**; solo el mapa pierde precisión (se marca con aviso).
 
-> ⚠️ **Entornos restringidos (p. ej. Claude Code on the web con allowlist):**
-> los geocodificadores devuelven HTTP 403 y el script cae al modo proxy. Para el
-> mapa preciso, ejecuta el script **en tu equipo local** (tu red sí alcanza el
-> Census) **o** crea un entorno con política de red que permita
-> `geocoding.geo.census.gov` y `nominatim.openstreetmap.org`
-> (ver https://code.claude.com/docs/en/claude-code-on-the-web).
+> ⚠️ **Claude Code on the web (allowlist de red):** Census y Nominatim devuelven
+> HTTP 403, pero **`maps.googleapis.com` SÍ es alcanzable**. Por eso, con una
+> **API key de Google** el script geocodifica con precisión **desde el entorno web**.
+> Sin key, ejecútalo **en tu equipo local** (tu red alcanza el Census gratis).
+> Docs de red: https://code.claude.com/docs/en/claude-code-on-the-web
+
+### Calidad de geocodificación y direcciones a revisar
+
+Con Google, el Excel añade columnas `Calidad geo`, `Tipo geo`, `Fuera area?`,
+`ZIP coincide?` y `Direccion segun Google`, y una hoja **`Revisar_Direcciones`**
+con las paradas dudosas (sin match, baja precisión, fuera del área, o ZIP que no
+coincide). Esos puntos **no se usan para calcular los centroides** de los WA (para
+no distorsionar los grupos) y aparecen como capa "⚠ Revisar" en el mapa.
 
 ---
 
@@ -68,10 +80,15 @@ El script las obtiene así, en orden:
 ```bash
 pip install -r requirements.txt
 
-# Geocodifica (Census/Nominatim) y, si no hay red, cae a proxy:
+# PRECISO con Google Maps (recomendado). La key no se guarda en disco:
+export GOOGLE_MAPS_API_KEY="TU_API_KEY"     # Windows PowerShell: $env:GOOGLE_MAPS_API_KEY="TU_API_KEY"
+python optimize_wa.py --input data/stop_information.csv --outdir output
+#   o:  python optimize_wa.py --google-key TU_API_KEY ...
+
+# Sin key: intenta Census/Nominatim y, si no hay red, cae a proxy:
 python optimize_wa.py --input data/stop_information.csv --outdir output
 
-# Forzar modo offline (sin intentar geocodificar):
+# Forzar modo offline (sin geocodificar):
 python optimize_wa.py --input data/stop_information.csv --no-geocode
 ```
 

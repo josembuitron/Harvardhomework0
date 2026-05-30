@@ -120,6 +120,64 @@ def _clean_addr_field(s: str) -> str:
     return ("" if s is None else str(s)).replace(",", " ").replace('"', " ").strip()
 
 
+def _zip_from_components(result: dict) -> str:
+    for comp in result.get("address_components", []):
+        if "postal_code" in comp.get("types", []):
+            return comp.get("long_name", "")
+    return ""
+
+
+def geocode_google(df: pd.DataFrame, api_key: str, pause: float = 0.02,
+                   timeout: int = 20):
+    """Geocodifica con Google Maps Geocoding API (preciso, cobertura US completa).
+    Devuelve dict: id_parada -> {lat, lon, location_type, partial, formatted, ret_zip, status}.
+    Maneja OVER_QUERY_LIMIT con reintento exponencial corto."""
+    import requests
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    out: dict[str, dict] = {}
+    n = len(df)
+    for k, (_, r) in enumerate(df.iterrows(), 1):
+        params = {"address": r["direccion_full"], "key": api_key,
+                  "region": "us", "components": "country:US"}
+        delay = 0.5
+        for attempt in range(5):
+            try:
+                resp = requests.get(url, params=params, timeout=timeout)
+                js = resp.json()
+            except Exception as e:
+                out[r[COL_ID]] = {"status": f"EXC:{type(e).__name__}"}
+                break
+            st = js.get("status")
+            if st == "OK" and js.get("results"):
+                g = js["results"][0]
+                loc = g["geometry"]["location"]
+                out[r[COL_ID]] = {
+                    "lat": loc["lat"], "lon": loc["lng"],
+                    "location_type": g["geometry"].get("location_type", ""),
+                    "partial": bool(g.get("partial_match", False)),
+                    "formatted": g.get("formatted_address", ""),
+                    "ret_zip": _zip_from_components(g),
+                    "status": "OK",
+                }
+                break
+            if st == "OVER_QUERY_LIMIT":
+                time.sleep(delay)
+                delay *= 2
+                continue
+            if st == "REQUEST_DENIED":
+                # key invalida o API no habilitada -> abortar todo con mensaje claro
+                raise RuntimeError(
+                    "Google REQUEST_DENIED: " + js.get("error_message", "revisa la API key / habilita Geocoding API"))
+            out[r[COL_ID]] = {"status": st or "ERROR"}
+            break
+        if k % 200 == 0:
+            print(f"[geo] Google: {k}/{n} ...", flush=True)
+        time.sleep(pause)
+    ok = sum(1 for v in out.values() if v.get("status") == "OK")
+    print(f"[geo] Google: {ok}/{n} con match", flush=True)
+    return out
+
+
 def geocode_census_batch(df: pd.DataFrame, chunk: int = 1000, timeout: int = 120):
     """Geocodifica con el batch del US Census Bureau (gratis, sin key).
     Devuelve dict: id_parada -> (lat, lon). Lanza excepcion si la red lo bloquea."""
@@ -225,13 +283,84 @@ def parse_eta_minutes(series: pd.Series) -> pd.Series:
     return series.map(to_min)
 
 
-def add_coordinates(df: pd.DataFrame, do_geocode: bool):
-    """Anade columnas lat/lon y devuelve (df, modo) donde modo in {'real','proxy'}."""
+def _calidad(loc_type: str, partial: bool, status: str) -> str:
+    if status != "OK":
+        return "sin_match"
+    if loc_type == "ROOFTOP" and not partial:
+        return "alta"
+    if loc_type in ("ROOFTOP", "RANGE_INTERPOLATED") and not partial:
+        return "media"
+    return "baja"  # APPROXIMATE / GEOMETRIC_CENTER / partial_match
+
+
+def _flag_out_of_area(df: pd.DataFrame) -> pd.Series:
+    """Marca puntos fuera del area de operacion segun la nube de puntos confiables."""
+    good = df[df["geo_calidad"].isin(["alta", "media"]) & df["lat"].notna()]
+    if len(good) < 20:
+        return pd.Series(False, index=df.index)
+    lo_lat, hi_lat = good["lat"].quantile([0.01, 0.99])
+    lo_lon, hi_lon = good["lon"].quantile([0.01, 0.99])
+    # margen del 25% del rango
+    mlat = (hi_lat - lo_lat) * 0.25 + 1e-6
+    mlon = (hi_lon - lo_lon) * 0.25 + 1e-6
+    out = (~df["lat"].between(lo_lat - mlat, hi_lat + mlat)) | \
+          (~df["lon"].between(lo_lon - mlon, hi_lon + mlon))
+    return out.fillna(False)
+
+
+def add_coordinates(df: pd.DataFrame, do_geocode: bool, google_key: str | None = None):
+    """Anade lat/lon + columnas de calidad de geocodificacion.
+    Devuelve (df, modo) con modo in {'google','real','proxy'}."""
     df = df.copy()
     df["lat"] = np.nan
     df["lon"] = np.nan
-    source = "proxy"
-    if do_geocode:
+    df["geo_status"] = "PROXY"
+    df["geo_location_type"] = ""
+    df["geo_partial"] = False
+    df["geo_formatted"] = ""
+    df["geo_zip_ok"] = True
+    df["geo_calidad"] = "proxy"
+    df["geo_fuera_area"] = False
+    mode = "proxy"
+
+    # --- 1) Google Maps (preciso, unico geocoder alcanzable en este entorno) ---
+    if google_key:
+        print("[geo] Geocodificando con Google Maps Geocoding API ...", flush=True)
+        g = geocode_google(df, google_key)
+        zip_in = df.set_index(COL_ID)[COL_ZIP].astype(str).str.strip()
+        for i, r in df.iterrows():
+            rec = g.get(r[COL_ID], {"status": "ERROR"})
+            df.at[i, "geo_status"] = rec.get("status", "ERROR")
+            if rec.get("status") == "OK":
+                df.at[i, "lat"] = rec["lat"]
+                df.at[i, "lon"] = rec["lon"]
+                df.at[i, "geo_location_type"] = rec.get("location_type", "")
+                df.at[i, "geo_partial"] = rec.get("partial", False)
+                df.at[i, "geo_formatted"] = rec.get("formatted", "")
+                rz = str(rec.get("ret_zip", "")).strip()
+                df.at[i, "geo_zip_ok"] = (rz == str(r[COL_ZIP]).strip()) if rz else False
+            df.at[i, "geo_calidad"] = _calidad(rec.get("location_type", ""),
+                                               rec.get("partial", False),
+                                               rec.get("status", "ERROR"))
+        ok = (df["geo_status"] == "OK").mean()
+        print(f"[geo] Cobertura Google: {ok:.0%} | alta={int((df['geo_calidad']=='alta').sum())} "
+              f"media={int((df['geo_calidad']=='media').sum())} "
+              f"baja={int((df['geo_calidad']=='baja').sum())} "
+              f"sin_match={int((df['geo_calidad']=='sin_match').sum())}", flush=True)
+        # marca direcciones fuera del area de operacion
+        df["geo_fuera_area"] = _flag_out_of_area(df)
+        # rellena las sin coordenada (sin_match) con proxy para no perder la parada
+        if df["lat"].isna().any():
+            px = proxy_coords(df)
+            miss = df["lat"].isna().to_numpy()
+            df.loc[miss, "lat"] = px[miss, 0]
+            df.loc[miss, "lon"] = px[miss, 1]
+        if ok >= 0.5:
+            return df, "google"
+        print("[geo] Cobertura Google insuficiente; revisa la API key.", flush=True)
+
+    # --- 2) Census / Nominatim (para entornos sin la restriccion de red) ---
+    if do_geocode and not google_key:
         coords = {}
         try:
             print("[geo] Intentando Census batch geocoder ...", flush=True)
@@ -239,7 +368,6 @@ def add_coordinates(df: pd.DataFrame, do_geocode: bool):
             print(f"[geo] Census devolvio {len(coords)} coincidencias", flush=True)
         except Exception as e:
             print(f"[geo] Census no disponible ({type(e).__name__}: {e})", flush=True)
-        # Nominatim para las que falten
         missing = {r[COL_ID]: r["direccion_full"]
                    for _, r in df.iterrows() if r[COL_ID] not in coords}
         if coords and missing:
@@ -252,10 +380,12 @@ def add_coordinates(df: pd.DataFrame, do_geocode: bool):
             for i, r in df.iterrows():
                 if r[COL_ID] in coords:
                     df.at[i, "lat"], df.at[i, "lon"] = coords[r[COL_ID]]
+                    df.at[i, "geo_status"] = "OK"
+                    df.at[i, "geo_calidad"] = "media"
             ok = df["lat"].notna().mean()
             print(f"[geo] Cobertura de geocodificacion: {ok:.0%}", flush=True)
             if ok >= 0.6:
-                # rellena faltantes con proxy para no perder paradas
+                df["geo_fuera_area"] = _flag_out_of_area(df)
                 if df["lat"].isna().any():
                     px = proxy_coords(df)
                     miss = df["lat"].isna().to_numpy()
@@ -263,9 +393,13 @@ def add_coordinates(df: pd.DataFrame, do_geocode: bool):
                     df.loc[miss, "lon"] = px[miss, 1]
                 return df, "real"
         print("[geo] Sin geocodificacion suficiente -> modo geografia relativa (proxy).", flush=True)
+
+    # --- 3) Proxy offline ---
     px = proxy_coords(df)
     df["lat"], df["lon"] = px[:, 0], px[:, 1]
-    return df, source
+    df["geo_status"] = "PROXY"
+    df["geo_calidad"] = "proxy"
+    return df, mode
 
 
 # ----------------------------------------------------------------------------
@@ -379,10 +513,16 @@ def optimize(df: pd.DataFrame):
     # 2) WAs objetivo = existentes menos el que se disuelve
     target_was = sorted([w for w in df["wa_actual"].dropna().unique()
                          if w != WA_TO_DISSOLVE])
-    # Centroides ancla = miembros actuales NO pesados de cada WA (geografia actual)
+    # Coordenadas confiables (excluye sin_match y direcciones fuera del area)
+    reliable = ((df.get("geo_calidad", pd.Series("proxy", index=df.index)).to_numpy() != "sin_match")
+                & (~df.get("geo_fuera_area", pd.Series(False, index=df.index)).to_numpy()))
+    # Centroides ancla = miembros actuales NO pesados y confiables de cada WA
     centroids = {}
     for w in target_was:
-        m = (df["wa_actual"] == w).to_numpy() & (~heavy_mask)
+        base = (df["wa_actual"] == w).to_numpy() & (~heavy_mask)
+        m = base & reliable
+        if not m.any():
+            m = base
         centroids[w] = coords_all[m].mean(axis=0) if m.any() else coords_all.mean(axis=0)
 
     # 3) Asignacion de cambio minimo
@@ -390,7 +530,10 @@ def optimize(df: pd.DataFrame):
 
     # 4) Recalcular centroides con la asignacion final (para mapa/etiquetas)
     for w in target_was + [WA_HEAVY]:
-        m = (df["wa_propuesto"] == w).to_numpy()
+        base = (df["wa_propuesto"] == w).to_numpy()
+        m = base & reliable
+        if not m.any():
+            m = base
         if m.any():
             centroids[w] = coords_all[m].mean(axis=0)
 
@@ -453,7 +596,16 @@ def print_report(df: pd.DataFrame, summary: pd.DataFrame, mode: str):
     print("\n" + "=" * 70)
     print("REPORTE DE OPTIMIZACION DE WORK AREAS")
     print("=" * 70)
-    print(f"Modo de geografia : {'COORDENADAS REALES (geocodificadas)' if mode=='real' else 'GEOGRAFIA RELATIVA (proxy offline)'}")
+    mode_lbl = {"google": "COORDENADAS REALES (Google Maps)",
+                "real": "COORDENADAS REALES (geocodificadas)",
+                "proxy": "GEOGRAFIA RELATIVA (proxy offline)"}.get(mode, mode)
+    print(f"Modo de geografia : {mode_lbl}")
+    if "geo_calidad" in df.columns and mode in ("google", "real"):
+        vc = df["geo_calidad"].value_counts().to_dict()
+        print(f"Calidad geocod.   : alta={vc.get('alta',0)} media={vc.get('media',0)} "
+              f"baja={vc.get('baja',0)} sin_match={vc.get('sin_match',0)}")
+        print(f"Direcciones a revisar (fuera de area / baja / sin match): "
+              f"{int((df['geo_calidad'].isin(['sin_match','baja']) | df['geo_fuera_area']).sum())}")
     print(f"Total de paradas  : {len(df)}")
     print(f"  - Sobrepeso >100kg -> WA {WA_HEAVY} : {int(df['es_sobrepeso'].sum())}")
     print(f"  - Sin asignar (reasignadas)        : {int(df['sin_asignar'].sum())}")
@@ -558,7 +710,9 @@ def write_excel(df: pd.DataFrame, summary: pd.DataFrame, mode: str, path: str):
         ("cambia", "Cambia?"), ("paquetes_n", "Paquetes"),
         ("peso_total_n", "Peso total"), ("peso_individual", "Peso individual"),
         ("es_sobrepeso", "Sobrepeso?"), ("lat", "Lat"), ("lon", "Lon"),
-        ("motivo", "Motivo"),
+        ("geo_calidad", "Calidad geo"), ("geo_location_type", "Tipo geo"),
+        ("geo_fuera_area", "Fuera area?"), ("geo_zip_ok", "ZIP coincide?"),
+        ("geo_formatted", "Direccion segun Google"), ("motivo", "Motivo"),
     ]
     for j, (_, h) in enumerate(out_cols, start=1):
         ws2.cell(row=1, column=j, value=h)
@@ -592,6 +746,31 @@ def write_excel(df: pd.DataFrame, summary: pd.DataFrame, mode: str, path: str):
                     [COL_ID, COL_NAME, COL_ADDR, COL_CITY, COL_ZIP, "wa_actual",
                      "peso_total_n", "paquetes_n", "peso_individual"]])
     autofit(ws3)
+
+    # --- Hoja: Revisar direcciones (calidad baja / fuera de area / ZIP no coincide) ---
+    flag = (df["geo_calidad"].isin(["sin_match", "baja"]) | df["geo_fuera_area"]
+            | (~df["geo_zip_ok"].astype(bool)))
+    rev = df[flag].copy()
+    if len(rev):
+        ws5 = wb.create_sheet("Revisar_Direcciones")
+        ws5.cell(row=1, column=1,
+                 value=(f"Direcciones a revisar: {len(rev)} (sin match, baja precision, "
+                        f"fuera del area de operacion, o ZIP que no coincide). "
+                        f"Verifica/corrige y vuelve a geocodificar."))
+        ws5.cell(row=1, column=1).font = Font(bold=True, color="C00000")
+        rcols = [(COL_ID, "ID parada"), (COL_NAME, "Nombre/Empresa"),
+                 (COL_ADDR, "Direccion original"), (COL_ZIP, "ZIP"),
+                 ("geo_calidad", "Calidad"), ("geo_location_type", "Tipo geo"),
+                 ("geo_partial", "Parcial?"), ("geo_fuera_area", "Fuera area?"),
+                 ("geo_zip_ok", "ZIP coincide?"), ("geo_formatted", "Direccion segun Google"),
+                 ("wa_propuesto", "WA propuesto (provisional)")]
+        for j, (_, h) in enumerate(rcols, start=1):
+            ws5.cell(row=3, column=j, value=h)
+        style_header(ws5, len(rcols), row=3)
+        for _, row in rev.sort_values(["geo_fuera_area", "geo_calidad"], ascending=False).iterrows():
+            ws5.append([_fmt(row.get(src)) for src, _ in rcols])
+        autofit(ws5)
+        ws5.freeze_panes = "A4"
 
     # --- Hoja 4: Como aplicar en DRO ---
     ws4 = wb.create_sheet("Como_aplicar_en_DRO")
@@ -668,10 +847,14 @@ def write_map_html(df: pd.DataFrame, centroids: dict, mode: str, path: str):
     import folium
     wa_order = sorted(df["wa_propuesto"].unique())
     color_of = {wa: PALETTE[i % len(PALETTE)] for i, wa in enumerate(wa_order)}
-    center = [df["lat"].mean(), df["lon"].mean()]
+    # centra usando solo puntos confiables (evita que outliers descuadren el mapa)
+    base = df[(df["geo_calidad"] != "sin_match") & (~df["geo_fuera_area"])] if "geo_calidad" in df else df
+    if not len(base):
+        base = df
+    center = [base["lat"].median(), base["lon"].median()]
     m = folium.Map(location=center, zoom_start=12, tiles="OpenStreetMap")
 
-    if mode != "real":
+    if mode == "proxy":
         banner = ("<div style='position:fixed;top:8px;left:50px;z-index:9999;"
                   "background:#fff3cd;border:1px solid #ffc107;padding:6px 10px;"
                   "border-radius:6px;font:13px sans-serif;max-width:520px'>"
@@ -703,6 +886,22 @@ def write_map_html(df: pd.DataFrame, centroids: dict, mode: str, path: str):
                     f"text-shadow:0 0 3px #fff,0 0 3px #fff'>WA {wa}</div>"))
             ).add_to(fg)
         fg.add_to(m)
+    # Capa de direcciones a revisar (sin match / baja precision / fuera de area)
+    if "geo_fuera_area" in df.columns:
+        flagged = df[df["geo_calidad"].isin(["sin_match", "baja"]) | df["geo_fuera_area"]]
+        if len(flagged):
+            fgr = folium.FeatureGroup(name=f"⚠ Revisar direccion ({len(flagged)})", show=True)
+            for _, r in flagged.iterrows():
+                folium.CircleMarker(
+                    location=[r["lat"], r["lon"]], radius=6, color="#000000",
+                    fill=True, fill_color="#ff1744", fill_opacity=0.9, weight=2,
+                    popup=folium.Popup(
+                        f"<b>REVISAR</b><br>{_fmt(r.get(COL_ADDR))}<br>"
+                        f"Calidad: {r.get('geo_calidad')}"
+                        f"{' | FUERA DE AREA' if r.get('geo_fuera_area') else ''}<br>"
+                        f"Google entendio: {_fmt(r.get('geo_formatted'))}", max_width=300),
+                ).add_to(fgr)
+            fgr.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
     m.save(path)
 
@@ -727,12 +926,14 @@ def write_map_png(df: pd.DataFrame, centroids: dict, mode: str, path: str):
     if len(heavy):
         ax.scatter(heavy["lon"], heavy["lat"], s=120, marker="*", c="black",
                    label=f"Sobrepeso -> WA {WA_HEAVY}", zorder=5)
+    precise = mode in ("real", "google")
     title = ("Agrupacion propuesta por Work Area"
-             + ("  (coordenadas reales)" if mode == "real"
+             + ("  (coordenadas reales - Google)" if mode == "google"
+                else "  (coordenadas reales)" if mode == "real"
                 else "  (esquema de geografia relativa)"))
     ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_xlabel("Longitud" if mode == "real" else "x (relativo)")
-    ax.set_ylabel("Latitud" if mode == "real" else "y (relativo)")
+    ax.set_xlabel("Longitud" if precise else "x (relativo)")
+    ax.set_ylabel("Latitud" if precise else "y (relativo)")
     ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=9, framealpha=0.9)
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
@@ -750,6 +951,8 @@ def main():
     ap.add_argument("--outdir", default="output")
     ap.add_argument("--no-geocode", action="store_true",
                     help="No intentar geocodificar; usar geografia relativa (offline)")
+    ap.add_argument("--google-key", default=os.environ.get("GOOGLE_MAPS_API_KEY"),
+                    help="API key de Google Maps Geocoding (o variable de entorno GOOGLE_MAPS_API_KEY)")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -759,7 +962,7 @@ def main():
     print(f"      Sin asignar: {int(df['sin_asignar'].sum())} | Sobrepeso >100kg: {int(df['es_sobrepeso'].sum())}")
 
     print("[2/5] Geolocalizando ...")
-    df, mode = add_coordinates(df, do_geocode=not args.no_geocode)
+    df, mode = add_coordinates(df, do_geocode=not args.no_geocode, google_key=args.google_key)
 
     print("[3/5] Optimizando asignacion (clustering capacitado 100-200) ...")
     df, centroids = optimize(df)
