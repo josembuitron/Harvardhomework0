@@ -1,0 +1,8 @@
+# Datos de entrada y salidas (contienen direcciones/nombres de clientes - no versionar)
+wa_optimizer/output/
+wa_optimizer/data/
+*.xlsx
+*.html
+*.png
+__pycache__/
+*.pyc
